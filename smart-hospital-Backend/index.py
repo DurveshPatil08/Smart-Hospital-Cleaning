@@ -141,7 +141,7 @@ def login_user(email, password):
         "exp": datetime.now(timezone.utc) + timedelta(days=1),
         "iat": datetime.now(timezone.utc)
     }
-    token = jwt.encode(payload, jwt_secret, algorithm="HS265") # Note: HS256 is the standard
+    token = jwt.encode(payload, jwt_secret, algorithm="HS256")
     return {"success": True, "token": token}
 
 # --- Function 5: Task Assignment Logic ---
