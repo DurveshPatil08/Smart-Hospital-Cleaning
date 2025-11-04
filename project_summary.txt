@@ -1,0 +1,1916 @@
+Project Structure:
+    ├── docker-compose.yml
+└── smart-hospital-Frontend/
+        ├── index.html
+        ├── Dockerfile
+        ├── style.css
+        ├── app.js
+    └── pages/
+            ├── admin.html
+            ├── manager.html
+            ├── cleaner.html
+            ├── register.html
+            ├── login.html
+└── smart-hospital-Backend/
+        ├── config.py
+        ├── requirements.txt
+        ├── index.py
+        ├── Dockerfile
+        ├── list_models.py
+        ├── .dockerignore
+        ├── storage.py
+        ├── main.py
+        ├── test_gemini.py
+
+
+================================================================================
+
+File Contents:
+
+==================== FILE: docker-compose.yml ====================
+
+# Phase 3: Docker Compose File
+
+services:
+  # The Backend Service (Python/Flask)
+  backend:
+    build: ./smart-hospital-Backend
+    ports:
+      - "5000:5000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - JWT_SECRET=${JWT_SECRET}
+
+  # The Frontend Service (Nginx)
+  frontend:
+    build: ./smart-hospital-Frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+
+==================== FILE: smart-hospital-Backend/.dockerignore ====================
+
+# .dockerignore for the Backend
+
+# Ignore Python virtual environment
+venv/
+.venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore Git directory
+.git
+
+
+==================== FILE: smart-hospital-Backend/Dockerfile ====================
+
+# Phase 1: Dockerfile for the Backend
+
+# 1. Start with an official Python base image.
+# Using a 'slim' version keeps the final image size smaller.
+FROM python:3.10-slim
+
+# 2. Set the working directory inside the container.
+# This is where our application code will live.
+WORKDIR /app
+
+# 3. Copy only the requirements file first to leverage Docker's caching.
+# This layer will only be re-built if requirements.txt changes.
+COPY requirements.txt .
+
+# 4. Install the Python dependencies.
+# --no-cache-dir ensures we don't store the pip cache, making the image smaller.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 5. Copy the rest of the application source code into the container.
+COPY . .
+
+# 6. Expose the port that the Flask application runs on.
+EXPOSE 5000
+
+# 7. Define the command to run the application when the container starts.
+CMD ["python", "main.py"]
+
+
+==================== FILE: smart-hospital-Backend/config.py ====================
+
+import os
+import sys
+from dotenv import load_dotenv
+import google.generativeai as genai
+from supabase import create_client, Client
+
+# Load all environment variables from the single .env file
+load_dotenv()
+
+# --- Load All Keys ---
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+jwt_secret = os.getenv("JWT_SECRET")
+
+# --- Validate All Keys ---
+# This check ensures the app doesn't start with missing configuration
+if not all([supabase_url, supabase_key, gemini_api_key, jwt_secret]):
+    print("FATAL ERROR: One or more required environment variables are missing.", file=sys.stderr)
+    print("Please check your .env file and ensure all 4 keys are present.", file=sys.stderr)
+    sys.exit(1)
+
+# --- Initialize Supabase Client ---
+try:
+    supabase: Client = create_client(supabase_url, supabase_key)
+    print("Supabase client initialized successfully.")
+except Exception as e:
+    print(f"Error initializing Supabase client: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# --- Initialize Gemini Client ---
+try:
+    genai.configure(api_key=gemini_api_key)
+    # Use the latest model that supports image analysis
+    gemini_model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
+    print("Gemini model initialized successfully.")
+except Exception as e:
+    print(f"Error initializing Gemini model: {e}", file=sys.stderr)
+    sys.exit(1)
+
+==================== FILE: smart-hospital-Backend/index.py ====================
+
+# This file holds all the business logic (the 5 "functions")
+import storage
+from config import gemini_model, jwt_secret
+import io
+import bcrypt
+import jwt
+from datetime import datetime, timedelta, timezone
+from PIL import Image
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+
+# --- Function 1: Photo Verification Logic ---
+AI_PROMPT = """
+Analyze the attached image of a hospital room and determine its cleanliness level.
+Provide a 'status' (Clean, Partially Clean, Not Clean) and a one-sentence 'remark'.
+Example Response:
+Status: Clean
+Remark: The floor is mopped, and all surfaces are clear of debris.
+"""
+
+def analyze_room_image(image_bytes: bytes):
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        response = gemini_model.generate_content([AI_PROMPT, image])
+        
+        status = "Needs Manual Review"
+        remarks = "Could not parse AI response."
+        
+        for line in response.text.strip().split('\n'):
+            if line.lower().startswith('status:'):
+                status = line.split(':', 1)[1].strip()
+            elif line.lower().startswith('remark:'):
+                remarks = line.split(':', 1)[1].strip()
+        
+        if status not in ['Clean', 'Partially Clean', 'Not Clean']:
+             remarks = response.text.strip()
+             status = "Needs Manual Review"
+             
+        return {"success": True, "status": status, "remarks": remarks}
+    except Exception as e:
+        # This print statement is for debugging
+        print("--- BEGIN GEMINI API ERROR ---")
+        print(f"An exception occurred during Gemini API call: {e}")
+        print("--- END GEMINI API ERROR ---")
+        return {"success": False, "error": "Failed to analyze image."}
+
+# --- Function 2: Dashboard Logic ---
+def get_dashboard_data(hospital_id):
+    """Gets all cleaning records pending approval for a specific hospital."""
+    return storage.get_pending_records(hospital_id)
+
+def process_manager_approval(record_id, decision, hospital_id):
+    """Processes a manager's approval or rework decision for their hospital."""
+    # Now it correctly passes all three arguments to the next function
+    return storage.update_record_status(record_id, decision, hospital_id)
+
+# --- Function 3: Report Generation Logic ---
+# Replace the entire function in index.py with this one
+
+def generate_pdf_report(records_data: list, user_role: str, hospital_name: str = None):
+    """Takes a list of records and generates a role-specific PDF file with text wrapping."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("Weekly Hospital Cleaning Report", styles['h1']), Spacer(1, 12)]
+
+    if user_role == 'dean' and hospital_name:
+        story.append(Paragraph(f"For: {hospital_name}", styles['h2']))
+        story.append(Spacer(1, 12))
+    
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    story.append(Paragraph(f"Report generated on: {date_str}", styles['Normal']))
+    story.append(Spacer(1, 24))
+
+    if not records_data:
+        story.append(Paragraph("No approved cleaning records found for the past week.", styles['Normal']))
+    else:
+        if user_role == 'bmc_commissioner':
+            table_data = [["Hospital", "Room ID", "Cleaner ID", "Status", "Cleaned On", "AI Remarks"]]
+            for record in records_data:
+                cleaned_date = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d')
+                hosp_name = record.get('hospitals', {}).get('name', 'N/A') if record.get('hospitals') else 'N/A'
+                
+                # --- THIS IS THE FIX ---
+                # Wrap the long text in a Paragraph object to enable text wrapping.
+                ai_remarks_paragraph = Paragraph(record.get('ai_remarks', 'N/A'), styles['Normal'])
+                
+                table_data.append([
+                    hosp_name,
+                    record.get('room_id', 'N/A'),
+                    str(record.get('cleaner_id', 'N/A'))[:8],
+                    record.get('cleanliness_status', 'N/A'),
+                    cleaned_date,
+                    ai_remarks_paragraph # Use the paragraph object here
+                ])
+        else:
+            table_data = [["Room ID", "Cleaner ID", "Status", "Cleaned On", "AI Remarks"]]
+            for record in records_data:
+                cleaned_date = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d')
+
+                # --- THIS IS THE SAME FIX, APPLIED FOR THE DEAN'S REPORT ---
+                ai_remarks_paragraph = Paragraph(record.get('ai_remarks', 'N/A'), styles['Normal'])
+                
+                table_data.append([
+                    record.get('room_id', 'N/A'),
+                    str(record.get('cleaner_id', 'N/A'))[:8],
+                    record.get('cleanliness_status', 'N/A'),
+                    cleaned_date,
+                    ai_remarks_paragraph # Use the paragraph object here
+                ])
+        
+        report_table = Table(table_data)
+        style = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), # Good for vertical alignment
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
+        report_table.setStyle(style)
+        story.append(report_table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# --- Function 4: User Auth Logic ---
+# Add hospital_id to the function signature
+def register_new_user(email, password, role, full_name, hospital_id=None):
+    """Hashes a password and creates a new user in the database."""
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    result = storage.create_user(
+        email=email,
+        password_hash=hashed_password.decode('utf-8'),
+        role=role,
+        full_name=full_name,
+        hospital_id=hospital_id # Pass it to the storage function
+    )
+    return result
+
+def login_user(email, password):
+    """Verifies a user's password and issues a JWT token."""
+    user_result = storage.get_user_by_email(email)
+    
+    if not user_result.get("data"):
+        return {"success": False, "message": "Invalid email or password."}
+    
+    user_data = user_result["data"]
+    is_valid = bcrypt.checkpw(password.encode('utf-8'), user_data["password_hash"].encode('utf-8'))
+
+    if not is_valid:
+        return {"success": False, "message": "Invalid email or password."}
+
+    payload = {
+        "user_id": user_data["id"],
+        "role": user_data["role"],
+        "hospital_id": user_data.get("hospital_id"), # <-- ADD THIS LINE
+        "exp": datetime.now(timezone.utc) + timedelta(days=1),
+        "iat": datetime.now(timezone.utc)
+    }
+    token = jwt.encode(payload, jwt_secret, algorithm="HS256")
+    return {"success": True, "token": token}
+
+# --- Function 5: Task Assignment Logic ---
+def assign_new_task(room_id, cleaner_id, assigned_by_id, assignment_date, notes):
+    """Assigns a new cleaning task to a worker."""
+    return storage.create_task_assignment(
+        room_id, cleaner_id, assigned_by_id, assignment_date, notes
+    )
+
+def get_cleaner_tasks(cleaner_id):
+    """Gets all tasks for a specific cleaner."""
+    return storage.get_tasks_for_cleaner(cleaner_id)
+
+# --- Function 6: Manager Task Logic ---
+def assign_manager_task(assigned_by_id, assigned_to_id, description, due_date):
+    """Assigns a new high-level task to a manager."""
+    return storage.create_manager_task(
+        assigned_by_id, assigned_to_id, description, due_date
+    )
+
+def get_manager_tasks(manager_id):
+    """Gets all high-level tasks for a specific manager."""
+    return storage.get_tasks_for_manager(manager_id)
+
+def get_cleaner_list(hospital_id):
+    """Gets a list of all cleaners for a specific hospital."""
+    return storage.get_all_cleaners(hospital_id)
+
+==================== FILE: smart-hospital-Backend/list_models.py ====================
+
+import os
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+# Load environment variables
+load_dotenv()
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+if not gemini_api_key:
+    print("FATAL ERROR: GEMINI_API_KEY not found in .env file.")
+    exit()
+
+try:
+    # Configure the client
+    genai.configure(api_key=gemini_api_key)
+    
+    print("\n--- Available Models for 'generateContent' ---\n")
+    
+    count = 0
+    # List all models and filter for the ones that support generateContent
+    for m in genai.list_models():
+        if 'generateContent' in m.supported_generation_methods:
+            print(m.name)
+            count += 1
+    
+    print(f"\nFound {count} models.")
+
+    if count < 5:
+        print("\nWARNING: This is a very short list. Your google-generativeai library is almost certainly outdated.")
+        print("Please run: pip install --upgrade google-generativeai")
+
+except Exception as e:
+    print(f"\n--- AN ERROR OCCURRED ---")
+    print(f"Error Type: {type(e).__name__}")
+    print(f"Error Details: {e}")
+    print("-------------------------\n")
+==================== FILE: smart-hospital-Backend/main.py ====================
+
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS  # Import CORS
+from datetime import datetime
+import index  # Imports all functions from index.py
+import storage # Imports all functions from storage.py
+import jwt
+from config import jwt_secret
+
+app = Flask(__name__)
+CORS(app)  # Initialize CORS to allow all origins
+
+# --- Auth Routes ---
+
+# --- Util Route ---
+@app.route("/hospitals", methods=["GET"])
+def get_hospitals_route():
+    result = storage.get_hospitals()
+    return jsonify(result), (200 if result["success"] else 500)
+
+@app.route("/cleaners", methods=["GET"])
+def get_cleaners_route():
+    # --- NEW: Get the manager's hospital_id from their login token ---
+    try:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({"error": "Authorization header missing"}), 401
+        
+        token = auth_header.split(" ")[1]
+        payload = jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        user_hospital_id = payload.get('hospital_id')
+
+        if not user_hospital_id:
+            return jsonify({"error": "User is not associated with a hospital."}), 400
+
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, IndexError):
+        return jsonify({"error": "Invalid or expired token"}), 401
+    # --- END NEW LOGIC ---
+
+    # Pass the manager's hospital_id to the function
+    result = index.get_cleaner_list(user_hospital_id)
+    return jsonify(result), (200 if result["success"] else 500)
+
+@app.route("/register", methods=["POST"])
+def register_route():
+    data = request.get_json()
+    if not data or not all(k in data for k in ["email", "password", "role", "full_name"]):
+        return jsonify({"success": False, "message": "Missing required fields."}), 400
+    
+    hospital_id = data.get("hospital_id")
+    
+    result = index.register_new_user(data["email"], data["password"], data["role"], data["full_name"], hospital_id)
+    if result["success"]:
+        return jsonify(result), 201
+    else:
+        return jsonify(result), 409
+
+@app.route("/login", methods=["POST"])
+def login_route():
+    data = request.get_json()
+    if not data or not all(k in data for k in ["email", "password"]):
+        return jsonify({"success": False, "message": "Missing email or password."}), 400
+    
+    result = index.login_user(data["email"], data["password"])
+    if result["success"]:
+        return jsonify(result), 200
+    else:
+        return jsonify(result), 401 # 401 Unauthorized
+
+
+
+# --- Task Routes ---
+@app.route("/assign_task", methods=["POST"])
+def assign_task_route():
+    data = request.get_json()
+    if not data or not all(k in data for k in ["room_id", "cleaner_id", "assignment_date", "assigned_by_id"]):
+        return jsonify({"success": False, "message": "Missing required fields."}), 400
+    
+    result = index.assign_new_task(
+        data["room_id"], data["cleaner_id"], data["assigned_by_id"],
+        data["assignment_date"], data.get("notes", "")
+    )
+    return jsonify(result), (201 if result["success"] else 500)
+
+@app.route("/tasks/<string:cleaner_id>", methods=["GET"])
+def get_tasks_route(cleaner_id):
+    result = index.get_cleaner_tasks(cleaner_id)
+    return jsonify(result), (200 if result["success"] else 500)
+
+# --- Manager Task Routes ---
+@app.route("/assign_manager_task", methods=["POST"])
+def assign_manager_task_route():
+    data = request.get_json()
+    if not data or not all(k in data for k in ["assigned_by_id", "assigned_to_id", "description", "due_date"]):
+        return jsonify({"success": False, "message": "Missing required fields."}), 400
+    
+    result = index.assign_manager_task(
+        data["assigned_by_id"], data["assigned_to_id"],
+        data["description"], data["due_date"]
+    )
+    return jsonify(result), (201 if result["success"] else 500)
+
+@app.route("/manager_tasks/<string:manager_id>", methods=["GET"])
+def get_manager_tasks_route(manager_id):
+    result = index.get_manager_tasks(manager_id)
+    return jsonify(result), (200 if result["success"] else 500)
+
+# --- Verification Route ---
+# Replace your entire /verify_room route with this
+@app.route("/verify_room", methods=["POST"])
+def verify_room_endpoint():
+    # --- Step 1: Check for the uploaded photo ---
+    if 'after_photo' not in request.files:
+        return jsonify({"error": "No 'after_photo' file part in the request."}), 400
+    
+    after_photo = request.files['after_photo']
+    
+    # --- Step 2: Get the form data (THIS WAS THE MISSING PART) ---
+    room_id = request.form.get('room_id')
+    cleaner_id = request.form.get('cleaner_id')
+    
+    # --- Step 3: Validate the form data ---
+    if not all([room_id, cleaner_id]):
+        return jsonify({"error": "Missing required form data."}), 400
+
+    # --- Step 4: Get the cleaner's hospital_id safely ---
+    cleaner_data_result = storage.get_user_by_id(cleaner_id)
+    if not cleaner_data_result.get("success") or not cleaner_data_result.get("data"):
+        return jsonify({"error": "Could not verify cleaner's hospital."}), 500
+    
+    hospital_id = cleaner_data_result["data"].get("hospital_id")
+    if not hospital_id:
+        return jsonify({"error": "This cleaner is not assigned to a hospital and cannot submit work."}), 400
+
+    # --- Step 5: Analyze the image with Gemini ---
+    image_bytes = after_photo.read()
+    ai_result = index.analyze_room_image(image_bytes)
+    
+    if not ai_result["success"]:
+        return jsonify({"error": ai_result.get("error", "Failed to analyze image.")}), 500
+
+    # --- Step 6: Save the record to the database ---
+    after_photo_url = f"https://your-bucket-url.com/photos/{after_photo.filename}"
+    before_photo_url = "http://example.com/before_placeholder.jpg" 
+
+    save_result = storage.save_cleaning_record(
+        room_id, cleaner_id, before_photo_url, after_photo_url,
+        ai_result["status"], ai_result["remarks"], hospital_id
+    )
+    return jsonify(save_result), (201 if save_result["success"] else 500)
+
+# --- Dashboard Routes ---
+@app.route("/dashboard", methods=["GET"])
+def get_dashboard_data():
+    try:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({"error": "Authorization header missing"}), 401
+        
+        token = auth_header.split(" ")[1]
+        payload = jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        user_hospital_id = payload.get('hospital_id')
+
+        if not user_hospital_id:
+            return jsonify({"error": "Manager is not associated with a hospital."}), 400
+
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, IndexError):
+        return jsonify({"error": "Invalid or expired token"}), 401
+    # --- END NEW LOGIC ---
+
+    # Pass the manager's hospital_id to get the filtered data
+    result = index.get_dashboard_data(user_hospital_id)
+    return jsonify(result), (200 if result["success"] else 500)
+
+# --- Report Route ---
+@app.route("/report/weekly", methods=["GET"])
+@app.route("/report/weekly", methods=["GET"])
+def generate_report_endpoint():
+    try:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({"error": "Authorization header missing"}), 401
+        
+        token = auth_header.split(" ")[1]
+        payload = jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        user_role = payload.get('role')
+        user_hospital_id = payload.get('hospital_id')
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    # --- THIS IS THE NEW LOGIC ---
+    hospital_to_filter = None
+    report_hospital_name = None
+
+    if user_role == 'dean':
+        hospital_to_filter = user_hospital_id
+        # Fetch the hospital name to display in the PDF title
+        report_hospital_name = storage.get_hospital_name_by_id(user_hospital_id)
+
+    # The commissioner's hospital_to_filter remains None to get all records
+    
+    result = storage.get_weekly_approved_records(hospital_id=hospital_to_filter)
+    
+    if not result["success"]:
+        return jsonify({"error": f"Failed to fetch data: {result['error']}"}), 500
+
+    try:
+        # Pass the user's role and hospital name to the PDF generator
+        pdf_content = index.generate_pdf_report(
+            records_data=result["data"],
+            user_role=user_role,
+            hospital_name=report_hospital_name
+        )
+        # --- END OF NEW LOGIC ---
+
+        filename = f"Weekly_Report_{datetime.now().strftime('%Y-%m-%d')}.pdf"
+        
+        return Response(
+            pdf_content,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f"attachment;filename={filename}"}
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
+    
+@app.route("/approve", methods=["POST", "OPTIONS"])
+def approve_task_route():
+    # This pre-flight check is needed for browsers
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    # Get the manager's hospital_id from their login token
+    try:
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({"error": "Authorization header missing"}), 401
+        
+        token = auth_header.split(" ")[1]
+        payload = jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        user_hospital_id = payload.get('hospital_id')
+
+        if not user_hospital_id:
+            return jsonify({"error": "Manager is not associated with a hospital."}), 400
+
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, IndexError):
+        return jsonify({"error": "Invalid or expired token"}), 401
+
+    # Get the data from the frontend
+    data = request.get_json()
+    if not data or not all(k in data for k in ["record_id", "new_status"]):
+        return jsonify({"success": False, "message": "Missing 'record_id' or 'new_status'."}), 400
+    
+    new_status = data["new_status"]
+    if new_status not in ["Approved", "Rework"]:
+        return jsonify({"success": False, "message": "Invalid status. Must be 'Approved' or 'Rework'."}), 400
+
+    # Call the approval function, passing the hospital_id for security
+    result = index.process_manager_approval(data["record_id"], new_status, user_hospital_id)
+    return jsonify(result), (200 if result["success"] else 500)
+
+
+# --- Run the Single Server ---
+if __name__ == "__main__":
+    print("Starting single Smart Hospital server...")
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+==================== FILE: smart-hospital-Backend/requirements.txt ====================
+
+# Flask for the web server
+Flask==2.3.2
+flask-cors==4.0.1  # For allowing frontend to connect
+# Supabase for the database
+supabase==1.0.3
+# For loading .env files
+python-dotenv==1.0.0
+# For AI image analysis
+google-generativeai  # Use latest version
+Pillow                 # Use latest version
+requests==2.31.0
+# For PDF report generation
+reportlab==4.0.4
+# For password hashing
+bcrypt==4.0.1
+# For creating and verifying JSON Web Tokens
+PyJWT==2.8.0
+
+==================== FILE: smart-hospital-Backend/storage.py ====================
+
+from config import supabase
+from datetime import datetime, timedelta, timezone
+
+def get_hospitals():
+    """Fetches a list of all hospitals."""
+    try:
+        response = supabase.table("hospitals").select("id, name").execute()
+        return {"success": True, "data": response.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# --- User and Auth Functions ---
+# Find the create_user function and add hospital_id
+def create_user(email, password_hash, role, full_name, hospital_id=None): # Add hospital_id
+    try:
+        user_data = {
+            "email": email, "password_hash": password_hash,
+            "role": role, "full_name": full_name
+        }
+        if hospital_id: # Add hospital_id if provided
+            user_data["hospital_id"] = hospital_id
+            
+        response = supabase.table("users").insert(user_data).execute()
+        return {"success": True, "data": response.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_user_by_email(email):
+    try:
+        response = supabase.table("users").select("*").eq("email", email).limit(1).execute()
+        return {"success": True, "data": response.data[0] if response.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# --- Task Assignment Functions ---
+def create_task_assignment(room_id, cleaner_id, assigned_by_id, assignment_date, notes):
+    try:
+        task_data = {
+            "room_id": room_id, "cleaner_id": cleaner_id, "assigned_by_id": assigned_by_id,
+            "assignment_date": assignment_date, "notes": notes, "status": "Pending"
+        }
+        response = supabase.table("task_assignments").insert(task_data).execute()
+        return {"success": True, "data": response.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_tasks_for_cleaner(cleaner_id):
+    try:
+        response = supabase.table("task_assignments").select("*").eq("cleaner_id", cleaner_id).execute()
+        return {"success": True, "data": response.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# --- Cleaning Records Functions ---
+# Find this function and add hospital_id
+def save_cleaning_record(room_id, cleaner_id, before_photo_url, after_photo_url, cleanliness_status, ai_remarks, hospital_id): # Add hospital_id
+    try:
+        record = {
+            "room_id": room_id, "cleaner_id": cleaner_id,
+            "before_photo_url": before_photo_url, "after_photo_url": after_photo_url,
+            "cleanliness_status": cleanliness_status, "ai_remarks": ai_remarks,
+            "manager_approval_status": "Pending",
+            "hospital_id": hospital_id # Add hospital_id to the record
+        }
+        response = supabase.table('cleaning_records').insert(record).execute()
+        return {"success": True, "data": response.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_pending_records(hospital_id):
+    """Gets pending records ONLY for a specific hospital."""
+    try:
+        response = supabase.table('cleaning_records') \
+            .select('*') \
+            .eq('manager_approval_status', 'Pending') \
+            .eq('hospital_id', hospital_id) \
+            .execute()
+        return {"success": True, "data": response.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Replace the entire function in storage.py with this one
+
+def update_record_status(record_id, new_status, hospital_id):
+    """
+    Securely updates a record's status, ensuring it matches the manager's hospital.
+    """
+    try:
+        # This query will only match if both the record ID and hospital ID are correct.
+        response = supabase.table('cleaning_records') \
+            .update({'manager_approval_status': new_status}) \
+            .eq('id', record_id) \
+            .eq('hospital_id', hospital_id) \
+            .execute()
+            
+        # --- THIS IS THE CRITICAL FIX ---
+        # If the query updated zero rows (because of a mismatch), response.data will be empty.
+        # This check now prevents the code from crashing.
+        if not response.data:
+             return {"success": False, "message": "Record not found in your hospital, or permission denied."}
+        # --- END OF FIX ---
+             
+        return {"success": True, "data": response.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# Find this function and modify it to accept an optional hospital_id
+def get_weekly_approved_records(hospital_id=None):
+    """Fetches weekly records, including the hospital name for each record."""
+    try:
+        seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        
+        # The select query now joins the hospitals table to get the name
+        query = supabase.table('cleaning_records') \
+            .select('*, hospitals(name)') \
+            .eq('manager_approval_status', 'Approved') \
+            .gte('created_at', seven_days_ago.isoformat())
+        
+        if hospital_id:
+            query = query.eq('hospital_id', hospital_id)
+            
+        response = query.execute()
+        print(f"Successfully fetched {len(response.data)} records for the weekly report.")
+        return {"success": True, "data": response.data, "error": None}
+    except Exception as e:
+        print(f"Database error fetching weekly report data: {e}")
+        return {"success": False, "data": [], "error": str(e)}
+    
+# --- Manager Task Functions ---
+def create_manager_task(assigned_by_id, assigned_to_id, description, due_date):
+    """Saves a new high-level task for a manager."""
+    try:
+        task_data = {
+            "assigned_by_id": assigned_by_id,
+            "assigned_to_id": assigned_to_id,
+            "task_description": description,
+            "due_date": due_date
+        }
+        response = supabase.table("manager_tasks").insert(task_data).execute()
+        return {"success": True, "data": response.data[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_tasks_for_manager(manager_id):
+    """Gets all high-level tasks assigned to a specific manager."""
+    try:
+        # We also want to fetch the full name of the person who assigned the task
+        response = supabase.table("manager_tasks").select("*, assigned_by:users!manager_tasks_assigned_by_id_fkey(full_name)").eq("assigned_to_id", manager_id).execute()
+        return {"success": True, "data": response.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+def get_user_by_id(user_id):
+    try:
+        response = supabase.table("users").select("*").eq("id", user_id).limit(1).execute()
+        return {"success": True, "data": response.data[0] if response.data else None}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+def get_all_cleaners(hospital_id):
+    """Fetches all users with the 'cleaner' role for a specific hospital."""
+    try:
+        # Add the .eq() filter to only get cleaners from the specified hospital
+        response = supabase.table("users") \
+            .select("id, full_name") \
+            .eq("role", "cleaner") \
+            .eq("hospital_id", hospital_id) \
+            .execute()
+        return {"success": True, "data": response.data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+def get_hospital_name_by_id(hospital_id):
+    """Fetches the name of a single hospital by its ID."""
+    try:
+        response = supabase.table("hospitals").select("name").eq("id", hospital_id).limit(1).execute()
+        return response.data[0]['name'] if response.data else None
+    except Exception:
+        return None
+==================== FILE: smart-hospital-Backend/test_gemini.py ====================
+
+import os
+from dotenv import load_dotenv
+import google.generativeai as genai
+from PIL import Image
+
+# Load environment variables
+load_dotenv()
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+if not gemini_api_key:
+    print("FATAL ERROR: GEMINI_API_KEY not found in .env file.")
+    exit()
+
+print("API Key loaded successfully.")
+
+try:
+    # Configure the client
+    genai.configure(api_key=gemini_api_key)
+    
+    # Initialize the model
+    model = genai.GenerativeModel(model_name="models/gemini-flash-latest")
+    print("Gemini model initialized successfully.")
+
+    # Open a local test image
+    print("Opening test image...")
+    img = Image.open("test_image.jpeg") # Make sure you have this image file
+
+    # The prompt
+    prompt = "Analyze this image of a hospital room. What is its cleanliness status?"
+
+    # Generate content
+    print("Sending request to Gemini API...")
+    response = model.generate_content([prompt, img])
+
+    print("\n--- GEMINI RESPONSE ---")
+    print(response.text)
+    print("-----------------------\n")
+    print("Test completed successfully!")
+
+except Exception as e:
+    print(f"\n--- AN ERROR OCCURRED ---")
+    print(f"Error Type: {type(e).__name__}")
+    print(f"Error Details: {e}")
+    print("-------------------------\n")
+==================== FILE: smart-hospital-Frontend/Dockerfile ====================
+
+# Phase 2: Dockerfile for the Frontend
+
+# 1. Use an official, lightweight Nginx web server image.
+# 'alpine' images are very small and secure.
+FROM nginx:stable-alpine
+
+# 2. Copy all the frontend files into the default Nginx web root directory.
+# Nginx will automatically serve the index.html file from here.
+COPY . /usr/share/nginx/html
+
+# That's it! The base Nginx image already has a command to start the server,
+# and it's configured to expose port 80 by default.
+
+
+==================== FILE: smart-hospital-Frontend/app.js ====================
+
+document.addEventListener("DOMContentLoaded", () => {
+    const mainContent = document.getElementById("main-content");
+    const logoutButton = document.getElementById("logout-button");
+    const messageBox = document.getElementById("message-box");
+
+    const API_BASE_URL = "http://127.0.0.1:5000";
+
+    const showMessage = (message, isError = false) => {
+        const icon = isError ? '<i class="fas fa-exclamation-circle"></i>' : '<i class="fas fa-check-circle"></i>';
+        messageBox.innerHTML = `${icon}<span>${message}</span>`;
+        messageBox.className = `fixed top-5 right-5 p-4 rounded-lg shadow-2xl text-white flex items-center gap-3 text-lg glass-effect border ${
+            isError ? 'border-red-500/50' : 'border-green-500/50'
+        } fade-in`;
+        messageBox.classList.remove("hidden");
+        setTimeout(() => {
+            messageBox.classList.add("hidden");
+        }, 3000);
+    };
+
+    const getToken = () => localStorage.getItem("jwt_token");
+
+    const getUserData = () => {
+        const token = getToken();
+        if (!token) return null;
+        try {
+            return JSON.parse(atob(token.split('.')[1]));
+        } catch (e) {
+            console.error("Failed to parse token:", e);
+            logout(); // Corrupted token, force logout
+            return null;
+        }
+    };
+
+    const loadPage = async (page) => {
+        try {
+            const response = await fetch(`./pages/${page}.html`);
+            if (!response.ok) throw new Error("Page not found");
+            mainContent.innerHTML = await response.text();
+            initializePageSpecificLogic(page);
+        } catch (error) {
+            mainContent.innerHTML = `<p class="text-red-400 text-center">Error loading page: ${error.message}</p>`;
+        }
+    };
+
+    const router = () => {
+        const userData = getUserData();
+        if (userData) {
+            logoutButton.classList.remove("hidden");
+            const userRole = userData.role;
+            if (userRole === "cleaner") loadPage("cleaner");
+            else if (userRole === "manager") loadPage("manager");
+            else if (userRole === "dean" || userRole === "bmc_commissioner") loadPage("admin");
+            else logout();
+        } else {
+            logoutButton.classList.add("hidden");
+            window.location.hash === "#register" ? loadPage("register") : loadPage("login");
+        }
+    };
+
+    const initializePageSpecificLogic = (page) => {
+        const pageLoaders = {
+            login: setupLoginForm,
+            register: setupRegisterForm,
+            cleaner: setupCleanerDashboard,
+            manager: setupManagerDashboard,
+            admin: setupAdminDashboard,
+        };
+        if (pageLoaders[page]) pageLoaders[page]();
+    };
+    
+    // --- FORM HANDLERS ---
+    
+    const setupLoginForm = () => {
+        const form = document.getElementById("login-form");
+        if (!form) return;
+        
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const submitButton = form.querySelector('button[type="submit"]');
+            submitButton.disabled = true;
+            
+            localStorage.removeItem("jwt_token");
+            const data = Object.fromEntries(new FormData(form).entries());
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/login`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(data),
+                });
+                const result = await response.json();
+                if (!result.success) throw new Error(result.message);
+                localStorage.setItem("jwt_token", result.token);
+                showMessage("Login successful!");
+                router();
+            } catch (error) {
+                showMessage(error.message, true);
+                submitButton.disabled = false;
+            }
+        });
+
+        document.getElementById("register-link")?.addEventListener("click", (e) => {
+            e.preventDefault();
+            window.location.hash = "#register";
+            router();
+        });
+    };
+    
+    const setupRegisterForm = () => {
+        const form = document.getElementById("register-form");
+        if (!form) return;
+
+        const roleSelect = form.querySelector("#role");
+        const hospitalDiv = form.querySelector("#hospital-select-div");
+        const hospitalSelect = form.querySelector("#hospital");
+
+        const toggleHospital = () => {
+            if (roleSelect.value !== 'bmc_commissioner') {
+                hospitalDiv.classList.remove('hidden');
+                hospitalSelect.required = true;
+            } else {
+                hospitalDiv.classList.add('hidden');
+                hospitalSelect.required = false;
+            }
+        };
+
+        fetch(`${API_BASE_URL}/hospitals`).then(res => res.json()).then(result => {
+            if (result.success) {
+                hospitalSelect.innerHTML = result.data.map(h => `<option value="${h.id}">${h.name}</option>`).join('');
+            }
+        });
+
+        roleSelect.addEventListener('change', toggleHospital);
+        toggleHospital();
+
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const submitButton = form.querySelector('button[type="submit"]');
+            submitButton.disabled = true;
+            
+            const formData = new FormData(form);
+            const data = Object.fromEntries(formData.entries());
+            if (data.role !== 'bmc_commissioner') data.hospital_id = data.hospital;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/register`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(data),
+                });
+                const result = await response.json();
+                if (!result.success) throw new Error(result.message);
+                showMessage("Registration successful! Please log in.");
+                window.location.hash = "#login";
+                router();
+            } catch (error) {
+                showMessage(error.message, true);
+                submitButton.disabled = false;
+            }
+        });
+
+        document.getElementById("login-link")?.addEventListener("click", (e) => {
+            e.preventDefault();
+            window.location.hash = "#login";
+            router();
+        });
+    };
+
+    const setupCleanerDashboard = () => {
+        // Add user welcome section
+        const userData = getUserData();
+        const welcomeElement = document.createElement('div');
+        welcomeElement.className = 'mb-6 p-4 glass-effect rounded-lg border border-gray-700 fade-in';
+        welcomeElement.innerHTML = `
+            <div class="flex items-center gap-3">
+                <div class="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center text-white font-semibold">
+                    ${userData.full_name ? userData.full_name.charAt(0).toUpperCase() : 'C'}
+                </div>
+                <div>
+                    <h3 class="text-white font-semibold">Welcome back, ${userData.full_name || 'Cleaner'}!</h3>
+                    <p class="text-gray-400 text-sm">Ready to submit your work?</p>
+                </div>
+            </div>
+        `;
+        const firstCard = document.querySelector('.card-hover');
+        if (firstCard) {
+            firstCard.parentNode.insertBefore(welcomeElement, firstCard);
+        }
+
+        const uploadForm = document.getElementById("upload-form");
+        if (uploadForm) {
+            const submitButton = uploadForm.querySelector("#upload-submit-button");
+            const spinner = uploadForm.querySelector("#upload-spinner");
+            const buttonText = uploadForm.querySelector("#upload-button-text");
+            
+            // Add file upload drag and drop functionality
+            const fileUploadArea = uploadForm.querySelector('.file-upload-area');
+            const fileInput = uploadForm.querySelector('#photo');
+            
+            if (fileUploadArea && fileInput) {
+                fileUploadArea.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    fileUploadArea.classList.add('dragover');
+                });
+                
+                fileUploadArea.addEventListener('dragleave', () => {
+                    fileUploadArea.classList.remove('dragover');
+                });
+                
+                fileUploadArea.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    fileUploadArea.classList.remove('dragover');
+                    if (e.dataTransfer.files.length) {
+                        fileInput.files = e.dataTransfer.files;
+                    }
+                });
+                
+                fileInput.addEventListener('change', () => {
+                    if (fileInput.files.length) {
+                        fileUploadArea.innerHTML = `
+                            <i class="fas fa-check text-green-400 text-3xl mb-3"></i>
+                            <p class="text-green-400 font-medium mb-2">File selected</p>
+                            <p class="text-sm text-gray-400">${fileInput.files[0].name}</p>
+                        `;
+                    }
+                });
+            }
+            
+            uploadForm.addEventListener("submit", async (e) => {
+                e.preventDefault();
+                submitButton.disabled = true;
+                spinner.classList.remove('hidden');
+                buttonText.textContent = 'Submitting...';
+                
+                const formData = new FormData();
+                formData.append('room_id', uploadForm.querySelector('#room').value);
+                formData.append('after_photo', uploadForm.querySelector('#photo').files[0]);
+                formData.append('cleaner_id', getUserData().user_id);
+                
+                try {
+                    const response = await fetch(`${API_BASE_URL}/verify_room`, { method: "POST", body: formData });
+                    const result = await response.json();
+                    if (!result.success) throw new Error(result.error || "Submission failed.");
+                    showMessage("Work submitted for verification.");
+                    uploadForm.reset();
+                    // Reset file upload area
+                    if (fileUploadArea) {
+                        fileUploadArea.innerHTML = `
+                            <i class="fas fa-camera text-3xl text-gray-400 mb-3"></i>
+                            <p class="text-gray-300 mb-2">Click to upload or drag and drop</p>
+                            <p class="text-sm text-gray-500">PNG, JPG, WEBP (Max. 10MB)</p>
+                            <input type="file" id="photo" name="photo" required accept="image/*" class="w-full mt-3">
+                        `;
+                    }
+                } catch (error) {
+                    showMessage(error.message, true);
+                } finally {
+                    submitButton.disabled = false;
+                    spinner.classList.add('hidden');
+                    buttonText.textContent = 'Submit for Verification';
+                }
+            });
+        }
+        
+        const taskListDiv = document.getElementById("task-list");
+        if (taskListDiv) {
+            fetch(`${API_BASE_URL}/tasks/${getUserData().user_id}`).then(res => res.json()).then(result => {
+                if (!result.success || result.data.length === 0) {
+                    taskListDiv.innerHTML = `
+                        <div class="text-center py-8">
+                            <i class="fas fa-clipboard-list text-3xl text-gray-500 mb-3"></i>
+                            <p class="text-gray-400">No tasks assigned currently.</p>
+                            <p class="text-sm text-gray-500 mt-1">Check back later for new assignments</p>
+                        </div>
+                    `;
+                    return;
+                }
+                taskListDiv.innerHTML = result.data.map(task => `
+                    <div class="p-4 glass-effect rounded-lg border border-gray-700 transition-all duration-300 hover:border-blue-500/50">
+                        <div class="flex justify-between items-center">
+                            <h4 class="font-bold text-lg text-white">${task.room_id}</h4>
+                            <span class="status-badge ${task.status === 'Pending' ? 'pending' : 'completed'}">${task.status}</span>
+                        </div>
+                        <p class="text-sm text-gray-400 mt-1"><strong>Date:</strong> ${new Date(task.assignment_date).toLocaleDateString()}</p>
+                        <p class="mt-2 text-gray-300 bg-gray-800/50 p-2 rounded-md">${task.notes || 'No notes provided.'}</p>
+                    </div>
+                `).join('');
+            }).catch(error => {
+                taskListDiv.innerHTML = `
+                    <div class="text-center py-8">
+                        <i class="fas fa-exclamation-triangle text-2xl text-red-400 mb-3"></i>
+                        <p class="text-red-400">Failed to load tasks</p>
+                        <p class="text-sm text-gray-400 mt-1">Please try again later</p>
+                    </div>
+                `;
+            });
+        }
+    };
+
+    const setupManagerDashboard = () => {
+        // Add manager welcome section
+        const userData = getUserData();
+        const welcomeElement = document.createElement('div');
+        welcomeElement.className = 'mb-6 p-4 glass-effect rounded-lg border border-gray-700 fade-in';
+        welcomeElement.innerHTML = `
+            <div class="flex items-center gap-3">
+                <div class="w-12 h-12 bg-purple-500 rounded-full flex items-center justify-center text-white font-semibold">
+                    ${userData.full_name ? userData.full_name.charAt(0).toUpperCase() : 'M'}
+                </div>
+                <div>
+                    <h3 class="text-white font-semibold">Manager Dashboard</h3>
+                    <p class="text-gray-400 text-sm">Welcome back, ${userData.full_name || 'Manager'}!</p>
+                </div>
+            </div>
+        `;
+        const firstCard = document.querySelector('.card-hover');
+        if (firstCard) {
+            firstCard.parentNode.insertBefore(welcomeElement, firstCard);
+        }
+
+        const cleanerSelect = document.getElementById("cleaner");
+        
+        if (cleanerSelect) {
+            fetch(`${API_BASE_URL}/cleaners`, { headers: { 'Authorization': `Bearer ${getToken()}` }})
+            .then(res => res.json()).then(result => {
+                if (result.success && result.data.length > 0) {
+                    cleanerSelect.innerHTML = '<option value="" disabled selected>Select a cleaner</option>' + 
+                    result.data.map(c => `<option value="${c.id}">${c.full_name}</option>`).join('');
+                } else {
+                    cleanerSelect.innerHTML = `<option value="" disabled>${result.error || "No cleaners found"}</option>`;
+                }
+            });
+        }
+
+        const assignTaskForm = document.getElementById("assign-task-form");
+        if (assignTaskForm) {
+            // Set default date to today
+            const dateInput = assignTaskForm.querySelector('#date');
+            if (dateInput) {
+                const today = new Date().toISOString().split('T')[0];
+                dateInput.value = today;
+                dateInput.min = today; // Prevent selecting past dates
+            }
+
+            assignTaskForm.addEventListener("submit", async (e) => {
+                e.preventDefault();
+                const submitButton = assignTaskForm.querySelector('button[type="submit"]');
+                submitButton.disabled = true;
+
+                const data = { ...Object.fromEntries(new FormData(assignTaskForm).entries()), assigned_by_id: userData.user_id };
+                data.cleaner_id = data.cleaner;
+
+                try {
+                    const response = await fetch(`${API_BASE_URL}/assign_task`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    });
+                    const result = await response.json();
+                    if (!result.success) throw new Error(result.message || "Failed to assign task.");
+                    showMessage("Task assigned successfully.");
+                    assignTaskForm.reset();
+                    // Reset date to today
+                    if (dateInput) {
+                        dateInput.value = today;
+                    }
+                    cleanerSelect.selectedIndex = 0;
+                } catch (error) {
+                    showMessage(error.message, true);
+                } finally {
+                    submitButton.disabled = false;
+                }
+            });
+        }
+
+        const approvalList = document.getElementById("approval-list");
+        const loadApprovals = async () => {
+            try {
+                const response = await fetch(`${API_BASE_URL}/dashboard`, { headers: { 'Authorization': `Bearer ${getToken()}` } });
+                const result = await response.json();
+                if (!result.success || result.data.length === 0) {
+                    approvalList.innerHTML = `
+                        <div class="text-center py-8">
+                            <i class="fas fa-check-circle text-3xl text-green-400 mb-3"></i>
+                            <p class="text-gray-400">All caught up!</p>
+                            <p class="text-sm text-gray-500 mt-1">No items pending approval</p>
+                        </div>
+                    `;
+                    return;
+                }
+                approvalList.innerHTML = result.data.map(item => {
+                    const statusColor = item.cleanliness_status === 'Clean' ? 'status-clean' : 
+                                      (item.cleanliness_status === 'Partially Clean' ? 'status-partial' : 'status-dirty');
+                    return `
+                    <div class="p-4 glass-effect rounded-lg border border-gray-700 transition-all duration-300 hover:border-yellow-500/50" id="record-${item.id}">
+                        <h4 class="font-bold text-lg text-white">${item.room_id}</h4>
+                        <p class="text-sm text-gray-400">Cleaner: ${item.cleaner_id.substring(0,8)}...</p>
+                        <div class="flex items-center gap-2 my-3">
+                            <span class="font-semibold text-gray-300">AI Status:</span>
+                            <span class="status-dot ${statusColor}"></span>
+                            <span class="text-gray-300">${item.cleanliness_status}</span>
+                        </div>
+                        <p class="text-gray-300 bg-gray-800/50 p-3 rounded-md italic border-l-4 border-blue-500">"${item.ai_remarks}"</p>
+                        <div class="mt-4 flex gap-2">
+                            <button class="approve-btn flex-1 btn-success text-white px-3 py-3 rounded-lg font-semibold flex items-center justify-center gap-2 disabled:opacity-50" data-id="${item.id}">
+                                <i class="fas fa-check"></i>
+                                <span>Approve</span>
+                            </button>
+                            <button class="rework-btn flex-1 btn-warning text-white px-3 py-3 rounded-lg font-semibold flex items-center justify-center gap-2 disabled:opacity-50" data-id="${item.id}">
+                                <i class="fas fa-redo"></i>
+                                <span>Rework</span>
+                            </button>
+                        </div>
+                    </div>
+                `}).join('');
+            } catch (error) {
+                approvalList.innerHTML = `
+                    <div class="text-center py-8">
+                        <i class="fas fa-exclamation-triangle text-2xl text-red-400 mb-3"></i>
+                        <p class="text-red-400">Failed to load approvals</p>
+                        <p class="text-sm text-gray-400 mt-1">Please try again later</p>
+                    </div>
+                `;
+            }
+        };
+        
+        if (approvalList) {
+            approvalList.addEventListener("click", async (e) => {
+                const button = e.target.closest("button");
+                if (!button) return;
+
+                const recordId = button.dataset.id;
+                const newStatus = button.classList.contains("approve-btn") ? "Approved" : "Rework";
+                
+                const allButtons = button.parentElement.querySelectorAll('button');
+                allButtons.forEach(btn => btn.disabled = true);
+                
+                try {
+                    const response = await fetch(`${API_BASE_URL}/approve`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` },
+                        body: JSON.stringify({ record_id: parseInt(recordId), new_status: newStatus })
+                    });
+                    const result = await response.json();
+                    if (!result.success) throw new Error(result.message || result.error);
+                    showMessage(`Record ${newStatus.toLowerCase()} successfully.`);
+                    document.getElementById(`record-${recordId}`).remove();
+                    
+                    // Check if no approvals left
+                    if (approvalList.children.length === 0) {
+                        approvalList.innerHTML = `
+                            <div class="text-center py-8">
+                                <i class="fas fa-check-circle text-3xl text-green-400 mb-3"></i>
+                                <p class="text-gray-400">All caught up!</p>
+                                <p class="text-sm text-gray-500 mt-1">No items pending approval</p>
+                            </div>
+                        `;
+                    }
+                } catch(error) {
+                    showMessage(error.message, true);
+                    allButtons.forEach(btn => btn.disabled = false);
+                }
+            });
+            loadApprovals();
+        }
+    };
+    
+    const setupAdminDashboard = () => {
+        // Add admin welcome section
+        const userData = getUserData();
+        const welcomeElement = document.createElement('div');
+        welcomeElement.className = 'mb-6 p-4 glass-effect rounded-lg border border-gray-700 fade-in';
+        welcomeElement.innerHTML = `
+            <div class="flex items-center gap-3">
+                <div class="w-12 h-12 bg-green-500 rounded-full flex items-center justify-center text-white font-semibold">
+                    ${userData.full_name ? userData.full_name.charAt(0).toUpperCase() : 'A'}
+                </div>
+                <div>
+                    <h3 class="text-white font-semibold">Administrative Dashboard</h3>
+                    <p class="text-gray-400 text-sm">Welcome back, ${userData.full_name || 'Admin'}!</p>
+                </div>
+            </div>
+        `;
+        const mainContainer = document.querySelector('.max-w-4xl');
+        if (mainContainer) {
+            mainContainer.parentNode.insertBefore(welcomeElement, mainContainer);
+        }
+
+        const downloadBtn = document.getElementById("download-report-button");
+        const roleDisplay = document.getElementById("admin-role-display");
+        const userDataForRole = getUserData();
+
+        if (roleDisplay && userDataForRole) {
+            roleDisplay.textContent = userDataForRole.role === 'bmc_commissioner' ? 'a Commissioner' : 'the Dean';
+        }
+        
+        if (downloadBtn) {
+            downloadBtn.addEventListener("click", async () => {
+                downloadBtn.disabled = true;
+                const buttonText = downloadBtn.querySelector('span');
+                const originalText = buttonText.textContent;
+                buttonText.textContent = 'Generating Report...';
+                
+                try {
+                    const response = await fetch(`${API_BASE_URL}/report/weekly`, { headers: { 'Authorization': `Bearer ${getToken()}` } });
+                    if (!response.ok) throw new Error((await response.json()).error);
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    const disposition = response.headers.get('content-disposition');
+                    let filename = "weekly-report.pdf";
+                    if (disposition) {
+                        const match = /filename="?([^"]+)"?/.exec(disposition);
+                        if (match) filename = match[1];
+                    }
+                    a.href = url;
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    window.URL.revokeObjectURL(url);
+                    showMessage("Report downloaded successfully.");
+                } catch (error) {
+                    showMessage(error.message, true);
+                } finally {
+                    downloadBtn.disabled = false;
+                    buttonText.textContent = originalText;
+                }
+            });
+        }
+    };
+
+    const logout = () => {
+        localStorage.removeItem("jwt_token");
+        window.location.hash = "#login";
+        showMessage("You have been logged out.");
+        router();
+    };
+
+    logoutButton.addEventListener("click", logout);
+    window.addEventListener("hashchange", router);
+    router();
+});
+==================== FILE: smart-hospital-Frontend/index.html ====================
+
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Hospital Cleaning</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+    <script src="app.js" defer></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+        }
+    </script>
+</head>
+<body class="bg-gradient-to-br from-gray-900 to-gray-800 min-h-screen text-gray-100">
+
+    <!-- Header / Navigation Bar -->
+    <header class="bg-gray-800/80 backdrop-blur-md border-b border-gray-700 sticky top-0 z-50">
+        <nav class="container mx-auto px-6 py-4 flex justify-between items-center">
+            <div class="text-2xl font-bold text-blue-400 flex items-center gap-3">
+                <i class="fas fa-hospital-alt"></i>
+                <span>SmartClean Hospitals</span>
+            </div>
+            <button id="logout-button" class="hidden bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg transition-all duration-200 flex items-center gap-2 shadow-lg">
+                <i class="fas fa-sign-out-alt"></i>
+                <span>Logout</span>
+            </button>
+        </nav>
+    </header>
+
+    <!-- Main Content Area -->
+    <main id="main-content" class="container mx-auto p-4 md:p-6 min-h-screen">
+        <div class="flex justify-center items-center h-64">
+            <div class="text-center">
+                <div class="animate-pulse text-5xl text-blue-400 mb-4">
+                    <i class="fas fa-spinner fa-spin"></i>
+                </div>
+                <p class="text-gray-400">Loading application...</p>
+            </div>
+        </div>
+    </main>
+    
+    <!-- Footer -->
+    <footer class="bg-gray-900 border-t border-gray-800 py-6 mt-8">
+        <div class="container mx-auto px-6 text-center">
+            <p class="text-sm text-gray-400">&copy; 2025 Smart Hospital Systems. All Rights Reserved.</p>
+        </div>
+    </footer>
+
+    <!-- Global Message Box (Toast) -->
+    <div id="message-box" class="hidden fixed top-5 right-5 p-4 rounded-lg shadow-2xl text-white flex items-center gap-3 text-lg z-50 bg-gray-800 border border-gray-700 backdrop-blur-sm">
+        <!-- Message content and icon go here -->
+    </div>
+
+</body>
+</html>
+==================== FILE: smart-hospital-Frontend/pages/admin.html ====================
+
+<div class="max-w-4xl mx-auto mt-10 fade-in">
+    <div class="glass-effect p-8 rounded-2xl shadow-2xl border border-gray-700 text-center">
+        <div class="inline-flex items-center justify-center w-24 h-24 rounded-full bg-green-500/20 mb-6">
+            <i class="fas fa-file-pdf text-4xl text-green-400"></i>
+        </div>
+        <h2 class="text-3xl font-bold text-white mb-4">Hospital Reports</h2>
+        <p class="text-gray-300 mb-8 max-w-prose mx-auto text-lg">
+            As <strong id="admin-role-display" class="text-blue-300">your role</strong>, you can download a comprehensive PDF report of all cleaning tasks marked as "Approved" within the last 7 days.
+        </p>
+        <button id="download-report-button"
+                class="w-full max-w-md mx-auto btn-success text-white py-4 px-6 rounded-xl text-lg font-semibold flex items-center justify-center gap-3 disabled:opacity-50 transition-all duration-200 hover:scale-105">
+            <i class="fas fa-download"></i>
+            <span>Download Weekly Report (PDF)</span>
+        </button>
+        
+        <!-- Additional Admin Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mt-12">
+            <div class="glass-effect p-6 rounded-xl border border-gray-700">
+                <div class="text-3xl font-bold text-blue-400 mb-2">24/7</div>
+                <div class="text-gray-400">System Uptime</div>
+            </div>
+            <div class="glass-effect p-6 rounded-xl border border-gray-700">
+                <div class="text-3xl font-bold text-green-400 mb-2">99.8%</div>
+                <div class="text-gray-400">AI Accuracy</div>
+            </div>
+            <div class="glass-effect p-6 rounded-xl border border-gray-700">
+                <div class="text-3xl font-bold text-purple-400 mb-2">1.2k+</div>
+                <div class="text-gray-400">Tasks Processed</div>
+            </div>
+        </div>
+    </div>
+</div>
+==================== FILE: smart-hospital-Frontend/pages/cleaner.html ====================
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 fade-in">
+    <!-- Submit Work Card -->
+    <div class="glass-effect p-6 rounded-xl card-hover">
+        <div class="flex items-center gap-3 mb-6">
+            <div class="p-2 bg-blue-500/20 rounded-lg">
+                <i class="fas fa-upload text-blue-400 text-xl"></i>
+            </div>
+            <h2 class="text-2xl font-bold text-white">Submit Your Work</h2>
+        </div>
+        <form id="upload-form">
+            <div class="mb-4">
+                <label for="room" class="block text-gray-300 text-sm font-medium mb-2">Room ID</label>
+                <input type="text" id="room" name="room" required 
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                       placeholder="e.g., ICU-101">
+            </div>
+            <div class="mb-6">
+                <label for="photo" class="block text-gray-300 text-sm font-medium mb-2">After Cleaning Photo</label>
+                <div class="file-upload-area">
+                    <i class="fas fa-camera text-3xl text-gray-400 mb-3"></i>
+                    <p class="text-gray-300 mb-2">Click to upload or drag and drop</p>
+                    <p class="text-sm text-gray-500">PNG, JPG, WEBP (Max. 10MB)</p>
+                    <input type="file" id="photo" name="photo" required accept="image/*" 
+                           class="w-full mt-3">
+                </div>
+            </div>
+            <button type="submit" id="upload-submit-button" 
+                    class="w-full btn-primary text-white py-3 px-4 rounded-lg font-semibold flex items-center justify-center gap-2 disabled:opacity-50">
+                <svg id="upload-spinner" class="animate-spin -ml-1 mr-3 h-5 w-5 text-white hidden" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span id="upload-button-text">Submit for Verification</span>
+            </button>
+        </form>
+    </div>
+
+    <!-- Assigned Tasks Card -->
+    <div class="glass-effect p-6 rounded-xl card-hover">
+        <div class="flex items-center gap-3 mb-6">
+            <div class="p-2 bg-green-500/20 rounded-lg">
+                <i class="fas fa-tasks text-green-400 text-xl"></i>
+            </div>
+            <h2 class="text-2xl font-bold text-white">Your Assigned Tasks</h2>
+        </div>
+        <div id="task-list" class="space-y-4 max-h-96 overflow-y-auto custom-scrollbar pr-2">
+            <div class="text-center py-8">
+                <i class="fas fa-spinner fa-spin text-2xl text-blue-400 mb-2"></i>
+                <p class="text-gray-400">Loading tasks...</p>
+            </div>
+        </div>
+    </div>
+</div>
+==================== FILE: smart-hospital-Frontend/pages/login.html ====================
+
+<div class="max-w-md mx-auto mt-10 fade-in">
+    <div class="glass-effect p-8 rounded-2xl shadow-2xl border border-gray-700">
+        <div class="text-center mb-8">
+            <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-blue-500/20 mb-4">
+                <i class="fas fa-hospital-user text-3xl text-blue-400"></i>
+            </div>
+            <h2 class="text-3xl font-bold text-white mt-4">Welcome Back</h2>
+            <p class="text-gray-400 mt-2">Please sign in to access your dashboard</p>
+        </div>
+        <form id="login-form">
+            <div class="mb-6">
+                <label for="email" class="block text-gray-300 text-sm font-medium mb-2">Email Address</label>
+                <input type="email" id="email" name="email" required
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                       placeholder="you@hospital.com">
+            </div>
+            <div class="mb-6">
+                <label for="password" class="block text-gray-300 text-sm font-medium mb-2">Password</label>
+                <input type="password" id="password" name="password" required
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                       placeholder="••••••••">
+            </div>
+            <button type="submit"
+                    class="w-full btn-primary text-white py-3 px-4 rounded-lg font-semibold flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                <i class="fas fa-sign-in-alt"></i>
+                <span>Sign In</span>
+            </button>
+        </form>
+        <p class="text-center text-gray-400 mt-6">
+            Don't have an account? 
+            <a href="#" id="register-link" class="text-blue-400 hover:text-blue-300 font-medium transition-colors">Register here</a>
+        </p>
+    </div>
+</div>
+==================== FILE: smart-hospital-Frontend/pages/manager.html ====================
+
+<div class="grid grid-cols-1 xl:grid-cols-2 gap-6 fade-in">
+    <!-- Assign Task Card -->
+    <div class="glass-effect p-6 rounded-xl card-hover">
+        <div class="flex items-center gap-3 mb-6">
+            <div class="p-2 bg-purple-500/20 rounded-lg">
+                <i class="fas fa-user-plus text-purple-400 text-xl"></i>
+            </div>
+            <h2 class="text-2xl font-bold text-white">Assign New Task</h2>
+        </div>
+        <form id="assign-task-form">
+            <div class="mb-4">
+                <label for="room" class="block text-gray-300 text-sm font-medium mb-2">Room ID</label>
+                <input type="text" id="room" name="room" required 
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                       placeholder="e.g., Ward-205">
+            </div>
+            <div class="mb-4">
+                <label for="cleaner" class="block text-gray-300 text-sm font-medium mb-2">Assign to Cleaner</label>
+                <select id="cleaner" name="cleaner" required 
+                        class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="" disabled selected>Loading cleaners...</option>
+                </select>
+            </div>
+            <div class="mb-4">
+                <label for="date" class="block text-gray-300 text-sm font-medium mb-2">Date</label>
+                <input type="date" id="date" name="date" required 
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div class="mb-6">
+                <label for="notes" class="block text-gray-300 text-sm font-medium mb-2">Notes</label>
+                <textarea id="notes" name="notes" rows="3" 
+                          class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                          placeholder="e.g., Deep clean required, special attention to bathroom..."></textarea>
+            </div>
+            <button type="submit" 
+                    class="w-full btn-primary text-white py-3 px-4 rounded-lg font-semibold flex items-center justify-center gap-2 disabled:opacity-50">
+                <i class="fas fa-paper-plane"></i>
+                <span>Assign Task</span>
+            </button>
+        </form>
+    </div>
+
+    <!-- Pending Approvals Card -->
+    <div class="glass-effect p-6 rounded-xl card-hover">
+        <div class="flex items-center gap-3 mb-6">
+            <div class="p-2 bg-yellow-500/20 rounded-lg">
+                <i class="fas fa-clipboard-check text-yellow-400 text-xl"></i>
+            </div>
+            <h2 class="text-2xl font-bold text-white">Pending Approvals</h2>
+        </div>
+        <div id="approval-list" class="space-y-6 max-h-[30rem] overflow-y-auto custom-scrollbar pr-2">
+            <div class="text-center py-8">
+                <i class="fas fa-spinner fa-spin text-2xl text-blue-400 mb-2"></i>
+                <p class="text-gray-400">Loading pending approvals...</p>
+            </div>
+        </div>
+    </div>
+</div>
+==================== FILE: smart-hospital-Frontend/pages/register.html ====================
+
+<div class="max-w-md mx-auto mt-10 fade-in">
+    <div class="glass-effect p-8 rounded-2xl shadow-2xl border border-gray-700">
+        <div class="text-center mb-8">
+            <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-blue-500/20 mb-4">
+                <i class="fas fa-user-plus text-3xl text-blue-400"></i>
+            </div>
+            <h2 class="text-3xl font-bold text-white mt-4">Create Account</h2>
+            <p class="text-gray-400 mt-2">Join the Smart Hospital Cleaning system</p>
+        </div>
+        <form id="register-form">
+            <div class="mb-4">
+                <label for="fullName" class="block text-gray-300 text-sm font-medium mb-2">Full Name</label>
+                <input type="text" id="fullName" name="fullName" required 
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                       placeholder="Dr. Alice Manager">
+            </div>
+            <div class="mb-4">
+                <label for="email" class="block text-gray-300 text-sm font-medium mb-2">Email Address</label>
+                <input type="email" id="email" name="email" required 
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                       placeholder="you@hospital.com">
+            </div>
+            <div class="mb-4">
+                <label for="password" class="block text-gray-300 text-sm font-medium mb-2">Password</label>
+                <input type="password" id="password" name="password" required 
+                       class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" 
+                       placeholder="••••••••">
+            </div>
+            <div class="mb-4">
+                <label for="role" class="block text-gray-300 text-sm font-medium mb-2">Role</label>
+                <select id="role" name="role" required 
+                        class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="cleaner">Cleaner</option>
+                    <option value="manager">Manager</option>
+                    <option value="dean">Hospital Dean</option>
+                    <option value="bmc_commissioner">BMC Commissioner</option>
+                </select>
+            </div>
+            <div id="hospital-select-div" class="mb-6 hidden">
+                <label for="hospital" class="block text-gray-300 text-sm font-medium mb-2">Hospital</label>
+                <select id="hospital" name="hospital" 
+                        class="w-full px-4 py-3 form-input rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"></select>
+            </div>
+            <button type="submit" 
+                    class="w-full btn-primary text-white py-3 px-4 rounded-lg font-semibold flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                <i class="fas fa-check-circle"></i>
+                <span>Create Account</span>
+            </button>
+        </form>
+        <p class="text-center text-gray-400 mt-6">
+            Already have an account? 
+            <a href="#" id="login-link" class="text-blue-400 hover:text-blue-300 font-medium transition-colors">Sign In</a>
+        </p>
+    </div>
+</div>
+==================== FILE: smart-hospital-Frontend/style.css ====================
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+body {
+    font-family: 'Inter', sans-serif;
+}
+
+/* Glass morphism effect */
+.glass-effect {
+    background: rgba(30, 41, 59, 0.7);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Card hover effects */
+.card-hover {
+    transition: all 0.3s ease;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.card-hover:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+    border-color: rgba(59, 130, 246, 0.3);
+}
+
+/* Status indicators */
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 6px;
+}
+
+.status-clean { background-color: #10b981; }
+.status-partial { background-color: #f59e0b; }
+.status-dirty { background-color: #ef4444; }
+.status-pending { background-color: #6b7280; }
+
+/* Custom scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: #1e293b;
+    border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #475569;
+    border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+/* File upload styling */
+.file-upload-area {
+    border: 2px dashed #4b5563;
+    border-radius: 0.5rem;
+    padding: 2rem;
+    text-align: center;
+    transition: all 0.3s ease;
+    background: rgba(30, 41, 59, 0.5);
+}
+
+.file-upload-area:hover {
+    border-color: #3b82f6;
+    background: rgba(30, 41, 59, 0.7);
+}
+
+.file-upload-area.dragover {
+    border-color: #3b82f6;
+    background: rgba(59, 130, 246, 0.1);
+}
+
+/* Form styling */
+.form-input {
+    background: #1e293b;
+    border: 1px solid #374151;
+    color: #f8fafc;
+    transition: all 0.2s ease;
+}
+
+.form-input:focus {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    background: #1e293b;
+}
+
+.form-input::placeholder {
+    color: #6b7280;
+}
+
+/* Button animations */
+.btn-primary {
+    background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+    transition: all 0.3s ease;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 20px -5px rgba(59, 130, 246, 0.4);
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #10b981 0%, #047857 100%);
+}
+
+.btn-warning {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+}
+
+/* Loading animations */
+.loading-pulse {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Fade in animation */
+.fade-in {
+    animation: fadeIn 0.5s ease-in-out;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* Task status badges */
+.status-badge {
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.status-badge.pending {
+    background: rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.status-badge.completed {
+    background: rgba(16, 185, 129, 0.2);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.status-badge.approved {
+    background: rgba(59, 130, 246, 0.2);
+    color: #3b82f6;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+}

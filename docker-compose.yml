@@ -1,22 +1,30 @@
-# Phase 3: Docker Compose File
+# Docker Compose v3.9+
+# This file orchestrates the building and running of the frontend and backend services.
 
 services:
   # The Backend Service (Python/Flask)
   backend:
-    build: ./smart-hospital-Backend
+    build:
+      context: ./smart-hospital-Backend
+      dockerfile: Dockerfile
+    # Use an .env file to securely manage secrets and configuration.
+    # Create a file named ".env" in the "smart-hospital-Backend" directory.
+    env_file:
+      - ./smart-hospital-Backend/.env
     ports:
       - "5000:5000"
-    environment:
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_KEY=${SUPABASE_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - JWT_SECRET=${JWT_SECRET}
+    # The container will restart automatically if it crashes.
+    restart: unless-stopped
 
   # The Frontend Service (Nginx)
   frontend:
-    build: ./smart-hospital-Frontend
+    build:
+      context: ./smart-hospital-Frontend
+      dockerfile: Dockerfile
     ports:
       - "8080:80"
+    # This ensures the backend starts before the frontend.
     depends_on:
       - backend
-
+    # The container will restart automatically if it crashes.
+    restart: unless-stopped

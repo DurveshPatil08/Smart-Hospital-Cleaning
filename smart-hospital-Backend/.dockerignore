@@ -1,14 +1,19 @@
-# .dockerignore for the Backend
-
-# Ignore Python virtual environment
+# Ignore Python virtual environments
 venv/
 .venv/
 
-# Ignore Python cache files
+# Ignore Python cache files and compiled files
 __pycache__/
 *.pyc
 *.pyo
 
 # Ignore Git directory
-.git
+.git/
 
+# CRITICAL: Ignore the environment file containing secrets
+.env
+
+# Ignore local test scripts and images not needed in the container
+test_gemini.py
+list_models.py
+test_image.jpeg

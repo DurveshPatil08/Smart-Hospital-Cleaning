@@ -47,21 +47,28 @@ def analyze_room_image(image_bytes: bytes):
         return {"success": False, "error": "Failed to analyze image."}
 
 # --- Function 2: Dashboard Logic ---
-def get_dashboard_data():
-    """Gets all cleaning records that are pending approval."""
-    return storage.get_pending_records()
+def get_dashboard_data(hospital_id):
+    """Gets all cleaning records pending approval for a specific hospital."""
+    return storage.get_pending_records(hospital_id)
 
-def process_manager_approval(record_id, decision):
-    """Processes a manager's approval or rework decision."""
-    return storage.update_record_status(record_id, decision)
+def process_manager_approval(record_id, decision, hospital_id):
+    """Processes a manager's approval or rework decision for their hospital."""
+    # Now it correctly passes all three arguments to the next function
+    return storage.update_record_status(record_id, decision, hospital_id)
 
 # --- Function 3: Report Generation Logic ---
-def generate_pdf_report(records_data: list):
-    """Takes a list of records and generates a PDF file in memory."""
+# Replace the entire function in index.py with this one
+
+def generate_pdf_report(records_data: list, user_role: str, hospital_name: str = None):
+    """Takes a list of records and generates a role-specific PDF file with text wrapping."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
     story = [Paragraph("Weekly Hospital Cleaning Report", styles['h1']), Spacer(1, 12)]
+
+    if user_role == 'dean' and hospital_name:
+        story.append(Paragraph(f"For: {hospital_name}", styles['h2']))
+        story.append(Spacer(1, 12))
     
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     story.append(Paragraph(f"Report generated on: {date_str}", styles['Normal']))
@@ -70,20 +77,49 @@ def generate_pdf_report(records_data: list):
     if not records_data:
         story.append(Paragraph("No approved cleaning records found for the past week.", styles['Normal']))
     else:
-        table_data = [["Room ID", "Cleaner ID", "Status", "Cleaned On", "AI Remarks"]]
-        for record in records_data:
-            cleaned_date = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d')
-            table_data.append([
-                record.get('room_id', 'N/A'), str(record.get('cleaner_id', 'N/A'))[:8], # Shorten UUID for display
-                record.get('cleanliness_status', 'N/A'), cleaned_date,
-                record.get('ai_remarks', 'N/A')
-            ])
+        if user_role == 'bmc_commissioner':
+            table_data = [["Hospital", "Room ID", "Cleaner ID", "Status", "Cleaned On", "AI Remarks"]]
+            for record in records_data:
+                cleaned_date = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d')
+                hosp_name = record.get('hospitals', {}).get('name', 'N/A') if record.get('hospitals') else 'N/A'
+                
+                # --- THIS IS THE FIX ---
+                # Wrap the long text in a Paragraph object to enable text wrapping.
+                ai_remarks_paragraph = Paragraph(record.get('ai_remarks', 'N/A'), styles['Normal'])
+                
+                table_data.append([
+                    hosp_name,
+                    record.get('room_id', 'N/A'),
+                    str(record.get('cleaner_id', 'N/A'))[:8],
+                    record.get('cleanliness_status', 'N/A'),
+                    cleaned_date,
+                    ai_remarks_paragraph # Use the paragraph object here
+                ])
+        else:
+            table_data = [["Room ID", "Cleaner ID", "Status", "Cleaned On", "AI Remarks"]]
+            for record in records_data:
+                cleaned_date = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d')
+
+                # --- THIS IS THE SAME FIX, APPLIED FOR THE DEAN'S REPORT ---
+                ai_remarks_paragraph = Paragraph(record.get('ai_remarks', 'N/A'), styles['Normal'])
+                
+                table_data.append([
+                    record.get('room_id', 'N/A'),
+                    str(record.get('cleaner_id', 'N/A'))[:8],
+                    record.get('cleanliness_status', 'N/A'),
+                    cleaned_date,
+                    ai_remarks_paragraph # Use the paragraph object here
+                ])
         
         report_table = Table(table_data)
         style = TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), # Good for vertical alignment
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
             ('GRID', (0, 0), (-1, -1), 1, colors.black)
         ])
         report_table.setStyle(style)
@@ -94,50 +130,36 @@ def generate_pdf_report(records_data: list):
     return buffer.getvalue()
 
 # --- Function 4: User Auth Logic ---
-def register_new_user(email, password, role, full_name):
+# Add hospital_id to the function signature
+def register_new_user(email, password, role, full_name, hospital_id=None):
     """Hashes a password and creates a new user in the database."""
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     result = storage.create_user(
         email=email,
         password_hash=hashed_password.decode('utf-8'),
         role=role,
-        full_name=full_name
+        full_name=full_name,
+        hospital_id=hospital_id # Pass it to the storage function
     )
     return result
 
 def login_user(email, password):
     """Verifies a user's password and issues a JWT token."""
-    print("\n--- NEW LOGIN ATTEMPT ---")
-    print(f"Attempting login for email: {email}")
-
     user_result = storage.get_user_by_email(email)
-
-    # --- THIS IS THE CRITICAL NEW LOGGING ---
-    # First, check if the database query itself was successful.
-    if not user_result.get("success"):
-        print(f"LOGIN FAILED: A database error occurred.")
-        print(f"Supabase Error Details: {user_result.get('error')}")
-        return {"success": False, "message": "A server error occurred during login."}
-
-    # If the query succeeded, now check if a user was actually found.
+    
     if not user_result.get("data"):
-        print("LOGIN FAILED: Email not found in database.")
         return {"success": False, "message": "Invalid email or password."}
-
+    
     user_data = user_result["data"]
-    print(f"SUCCESS: Found user ID: {user_data['id']}")
-
-    # Compare the provided password with the stored hash
     is_valid = bcrypt.checkpw(password.encode('utf-8'), user_data["password_hash"].encode('utf-8'))
 
     if not is_valid:
-        print("LOGIN FAILED: Password check failed.")
         return {"success": False, "message": "Invalid email or password."}
 
-    print("SUCCESS: Password is valid. Generating token.")
     payload = {
         "user_id": user_data["id"],
         "role": user_data["role"],
+        "hospital_id": user_data.get("hospital_id"), # <-- ADD THIS LINE
         "exp": datetime.now(timezone.utc) + timedelta(days=1),
         "iat": datetime.now(timezone.utc)
     }
@@ -154,3 +176,18 @@ def assign_new_task(room_id, cleaner_id, assigned_by_id, assignment_date, notes)
 def get_cleaner_tasks(cleaner_id):
     """Gets all tasks for a specific cleaner."""
     return storage.get_tasks_for_cleaner(cleaner_id)
+
+# --- Function 6: Manager Task Logic ---
+def assign_manager_task(assigned_by_id, assigned_to_id, description, due_date):
+    """Assigns a new high-level task to a manager."""
+    return storage.create_manager_task(
+        assigned_by_id, assigned_to_id, description, due_date
+    )
+
+def get_manager_tasks(manager_id):
+    """Gets all high-level tasks for a specific manager."""
+    return storage.get_tasks_for_manager(manager_id)
+
+def get_cleaner_list(hospital_id):
+    """Gets a list of all cleaners for a specific hospital."""
+    return storage.get_all_cleaners(hospital_id)

@@ -1,13 +1,15 @@
-# Phase 2: Dockerfile for the Frontend
-
-# 1. Use an official, lightweight Nginx web server image.
-# 'alpine' images are very small and secure.
+# Use a specific, stable version of Nginx based on the lightweight Alpine Linux.
+# 'alpine' images are minimal, which improves security and reduces image size.
 FROM nginx:stable-alpine
 
-# 2. Copy all the frontend files into the default Nginx web root directory.
-# Nginx will automatically serve the index.html file from here.
+# Copy the entire contents of the frontend directory (HTML, CSS, JS, etc.)
+# into the default Nginx web root directory.
 COPY . /usr/share/nginx/html
 
-# That's it! The base Nginx image already has a command to start the server,
-# and it's configured to expose port 80 by default.
+# The base Nginx image already includes a default configuration to serve files
+# from /usr/share/nginx/html on port 80. No further configuration is needed.
 
+# Expose port 80 for the Nginx web server.
+EXPOSE 80
+
+# The base image's default CMD starts the Nginx server in the foreground.
