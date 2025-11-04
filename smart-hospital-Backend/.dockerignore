@@ -1,0 +1,14 @@
+# .dockerignore for the Backend
+
+# Ignore Python virtual environment
+venv/
+.venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore Git directory
+.git
+

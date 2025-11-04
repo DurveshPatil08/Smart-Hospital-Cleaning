@@ -1,0 +1,22 @@
+# Phase 3: Docker Compose File
+
+services:
+  # The Backend Service (Python/Flask)
+  backend:
+    build: ./smart-hospital-Backend
+    ports:
+      - "5000:5000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - JWT_SECRET=${JWT_SECRET}
+
+  # The Frontend Service (Nginx)
+  frontend:
+    build: ./smart-hospital-Frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
