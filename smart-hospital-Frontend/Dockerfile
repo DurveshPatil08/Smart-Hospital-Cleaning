@@ -1,15 +1,13 @@
-# Use a specific, stable version of Nginx based on the lightweight Alpine Linux.
-# 'alpine' images are minimal, which improves security and reduces image size.
+# 1. Use the stable-alpine Nginx image
 FROM nginx:stable-alpine
 
-# Copy the entire contents of the frontend directory (HTML, CSS, JS, etc.)
-# into the default Nginx web root directory.
+# 2. Copy your static files (HTML, CSS, JS)
 COPY . /usr/share/nginx/html
 
-# The base Nginx image already includes a default configuration to serve files
-# from /usr/share/nginx/html on port 80. No further configuration is needed.
-
-# Expose port 80 for the Nginx web server.
+# 3. Expose port 80 (for documentation, Render uses $PORT)
 EXPOSE 80
 
-# The base image's default CMD starts the Nginx server in the foreground.
+# 4. This command will find the default Nginx config,
+#    replace 'listen 80;' with 'listen $PORT;',
+#    and then start the Nginx server.
+CMD sh -c "sed -i 's/listen 80;/listen $PORT;/g' /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
